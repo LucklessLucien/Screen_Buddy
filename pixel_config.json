@@ -1,0 +1,23 @@
+{
+  "MODEL": "gemma4:12b",
+  "MAX_TOOL_ROUNDS": 3,
+  "MONITOR": -1,
+  "IMAGE_SIZE": [
+    1280,
+    720
+  ],
+  "THINKING": false,
+  "CHANGE_THRESHOLD": 3,
+  "INTERVAL": 60,
+  "MAIL_CHECK_MINUTES": 5,
+  "OPACITY": 0.92,
+  "SPEAK_REPLIES": true,
+  "SPEAK_AUTO_COMMENTS": true,
+  "KOKORO_VOICE": "af_heart",
+  "KOKORO_SPEED": 0.9,
+  "TALK_KEY": "f9",
+  "TALK_MODE": "hold",
+  "WHISPER_MODEL": "base.en",
+  "WHISPER_LANGUAGE": "en",
+  "IMAP_SERVER": "imap.gmail.com"
+}
