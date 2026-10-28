@@ -30,8 +30,7 @@
 #     Character packs:                  see the pixel_packs folder
 #         (the first run downloads the voice files, a few hundred MB)
 #     Talk hotkey:                      pip install keyboard
-#     Calendar readout:                 pip install icalendar recurring-ical-events
-#     Calendar event creation:          Connect a Google Desktop OAuth app from Pixel's menu
+#     Google Calendar:                  Connect a Google Desktop OAuth app from Pixel's menu
 # Spoken replies require the natural voice engine; without it Pixel stays silent.
 # =====================================================================
 
@@ -62,7 +61,6 @@ import webbrowser         # opens websites in your normal browser
 import urllib.request     # downloads files (voice files, the calendar, Ollama's installer)
 import tkinter as tk      # draws the window, face, buttons (comes with Python)
 from tkinter import filedialog, messagebox, ttk
-import imaplib            # talks to your email server (IMAP protocol)
 import email              # understands the structure of an email message
 from email.header import decode_header, make_header  # decodes emoji/accents in subjects
 import mss                # takes screenshots
@@ -332,15 +330,10 @@ WHISPER_MODEL = "base.en"        # speech recognition size: "tiny.en" (fastest),
                                  # For other languages use "base" or "small" and set WHISPER_LANGUAGE below.
 WHISPER_LANGUAGE = "en"          # use None to auto-detect the language
 
-# Email and calendar are optional. The easiest way to set them up is the right-click menu
-# ("Set up email..." and "Set up calendar..."), but you can also type them here.
-# Use an APP PASSWORD (a special 16-character one), never your real password.
-# Never share this file with these filled in.
-EMAIL = ""                       # e.g. "you@gmail.com"
-APP_PASSWORD = ""                # e.g. "abcdefghijklmnop"
-CALENDAR_URL = ""                # Google Calendar secret iCal feed; read-only
-GOOGLE_CALENDAR_CREDENTIALS_JSON = ""  # DPAPI-protected OAuth credentials for creating events
-IMAP_SERVER = "imap.gmail.com"   # Gmail's server; other providers differ
+# Gmail and Google Calendar are optional. Connect from the right-click menu.
+# Email access uses Google OAuth and reads unread status plus sender/subject only.
+EMAIL = ""                       # Gmail address to monitor
+GOOGLE_OAUTH_CREDENTIALS_JSON = ""  # DPAPI-protected Google OAuth credentials
 
 # --- A settings file, so other people can change these WITHOUT editing the script ---
 # In the packaged .exe, Pixel creates pixel_config.json in his data folder on first run.
@@ -350,8 +343,8 @@ IMAP_SERVER = "imap.gmail.com"   # Gmail's server; other providers differ
 CONFIG_FILE = os.path.join(DATA_DIR, "pixel_config.json")
 CONFIGURABLE = ["MODEL", "MAX_TOOL_ROUNDS", "MONITOR", "IMAGE_SIZE", "THINKING", "CHANGE_THRESHOLD",
                 "INTERVAL", "MAIL_CHECK_MINUTES", "OPACITY", "SPEAK_REPLIES", "SPEAK_AUTO_COMMENTS", "KOKORO_VOICE",
-                "KOKORO_SPEED", "TALK_KEY", "TALK_MODE", "WHISPER_MODEL", "WHISPER_LANGUAGE", "IMAP_SERVER"]
-SECRET_CONFIG_KEYS = {"EMAIL": "email", "APP_PASSWORD": "app_password", "CALENDAR_URL": "calendar_url"}
+                "KOKORO_SPEED", "TALK_KEY", "TALK_MODE", "WHISPER_MODEL", "WHISPER_LANGUAGE"]
+SECRET_CONFIG_KEYS = {"EMAIL": "email"}
 
 
 def apply_config_file():
@@ -367,6 +360,10 @@ def apply_config_file():
             if "USE_KOKORO" in config:
                 config.pop("USE_KOKORO")
                 migrated = True
+            for obsolete_key in ("CALENDAR_URL", "calendar_url", "APP_PASSWORD", "app_password", "IMAP_SERVER"):
+                if obsolete_key in config:
+                    config.pop(obsolete_key, None)
+                    migrated = True
             for key, value in config.items():
                 if key in CONFIGURABLE:                         # only known settings are accepted
                     globals()[key] = tuple(value) if key == "IMAGE_SIZE" else value
@@ -401,7 +398,7 @@ def save_config_file():
 
 
 apply_config_file()
-EMAIL_ENABLED = bool(EMAIL and APP_PASSWORD)   # True only if both are filled in
+EMAIL_ENABLED = bool(EMAIL and GOOGLE_OAUTH_CREDENTIALS_JSON)
 
 
 # ---------------------------------------------------------------------
@@ -622,27 +619,39 @@ memories = load_memories()
 # 6. EMAIL FUNCTIONS (read-only: Pixel can never send or delete mail)
 # ---------------------------------------------------------------------
 def fetch_unread(limit=10):
-    """Connects to your inbox and returns (total_unread, [(uid, "sender: subject"), ...]).
-    Only the newest `limit` emails are listed."""
-    # "with" opens the connection and closes it automatically afterwards.
-    with imaplib.IMAP4_SSL(IMAP_SERVER) as M:
-        M.login(EMAIL, APP_PASSWORD)
-        M.select("INBOX", readonly=True)            # look, don't touch
-        _, data = M.uid("search", None, "UNSEEN")   # find unread emails
-        uids = data[0].split()                      # turn b"101 102" into [b"101", b"102"]
-        out = []
-        for uid in uids[-limit:]:                   # only the newest few
-            # PEEK = fetch without marking the email as read.
-            # We ask for headers only (From and Subject), never the body.
-            _, md = M.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
-            msg = email.message_from_bytes(md[0][1])
-            # decode_header/make_header turn encoded text (emoji, accents)
-            # into normal readable text.
-            sender = str(make_header(decode_header(msg.get("From", ""))))
-            subject = str(make_header(decode_header(msg.get("Subject", ""))))
-            line = f"{sender}: {subject}"
-            out.append((uid, line))
-        return len(uids), out
+    """Return the estimated unread count and recent inbox sender/subject headers."""
+    if not EMAIL or not google_gmail_scope_granted():
+        raise RuntimeError("Connect Google account from Pixel's menu and approve Gmail metadata access, then set up email.")
+    profile_request = urllib.request.Request(
+        "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+        headers={"Authorization": "Bearer " + get_google_access_token(), "Accept": "application/json"})
+    with urllib.request.urlopen(profile_request, timeout=25) as response:
+        account = json.loads(response.read().decode("utf-8")).get("emailAddress", "")
+    if account.casefold() != EMAIL.casefold():
+        raise RuntimeError(f"The connected Google account is {account}, but Pixel is set to monitor {EMAIL}. Connect the matching account or update the email address.")
+    query = urllib.parse.urlencode([
+        ("labelIds", "INBOX"), ("labelIds", "UNREAD"), ("maxResults", str(max(1, int(limit))))])
+    request = urllib.request.Request(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages?" + query,
+        headers={"Authorization": "Bearer " + get_google_access_token(), "Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=25) as response:
+        listing = json.loads(response.read().decode("utf-8"))
+
+    items = []
+    for item in listing.get("messages", []):
+        message_query = urllib.parse.urlencode([
+            ("format", "metadata"), ("metadataHeaders", "From"), ("metadataHeaders", "Subject")])
+        message_request = urllib.request.Request(
+            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{urllib.parse.quote(item['id'])}?{message_query}",
+            headers={"Authorization": "Bearer " + get_google_access_token(), "Accept": "application/json"})
+        with urllib.request.urlopen(message_request, timeout=25) as response:
+            message_data = json.loads(response.read().decode("utf-8"))
+        headers = {h.get("name", "").lower(): h.get("value", "")
+                   for h in message_data.get("payload", {}).get("headers", [])}
+        sender = str(make_header(decode_header(headers.get("from", ""))))
+        subject = str(make_header(decode_header(headers.get("subject", ""))))
+        items.append((item["id"], f"{sender}: {subject}"))
+    return int(listing.get("resultSizeEstimate", len(items))), items
 
 
 def mail_prompt(intro, items):
@@ -655,7 +664,7 @@ def mail_prompt(intro, items):
 def mail_job():
     """One-off email check used by email setup."""
     if not EMAIL_ENABLED:
-        ui_events.put(("idle", "Email isn't set up yet. Right-click me and choose Set up email."))
+        ui_events.put(("idle", "Email isn't set up yet. Right-click me and choose Set up email, then connect your Google account."))
         return
     try:
         total, items = fetch_unread(5)
@@ -663,7 +672,7 @@ def mail_job():
             ui_events.put(("happy", "No unread emails!"))
         else:
             # Hand the emails to the worker, labeled "mail" so it knows where they came from.
-            user_msgs.put(("mail", mail_prompt(f"The user has {total} unread emails. Latest:", items)))
+            user_msgs.put(("mail", mail_prompt(f"The inbox has about {total} unread emails. Latest:", items)))
     except Exception as e:
         ui_events.put(("idle", f"(Mail error: {e})"))
 
@@ -734,12 +743,12 @@ def load_settings():
 
 
 def save_settings():
-    """Saves voice preferences and DPAPI-protected calendar/email credentials."""
+    """Saves voice preferences and DPAPI-protected Google/email credentials."""
     try:
         stored = dict(settings)  # voice choices are ordinary preferences
-        for key, value in (("email", EMAIL), ("app_password", APP_PASSWORD),
-                           ("calendar_url", CALENDAR_URL),
-                           ("google_calendar_credentials", GOOGLE_CALENDAR_CREDENTIALS_JSON)):
+        for obsolete_key in ("calendar_url", "app_password", "google_calendar_credentials"):
+            stored.pop(obsolete_key, None)
+        for key, value in (("email", EMAIL), ("google_oauth_credentials", GOOGLE_OAUTH_CREDENTIALS_JSON)):
             if value:
                 stored[key] = protect_secret(value)
         write_json_atomic(SETTINGS_FILE, stored, indent=2)
@@ -772,11 +781,15 @@ try:
         saved_extras = json.load(f)
 except Exception:
     saved_extras = {}
-legacy_secrets_found = False
-for stored_key, global_key in (("calendar_url", "CALENDAR_URL"),
-                               ("google_calendar_credentials", "GOOGLE_CALENDAR_CREDENTIALS_JSON"),
-                               ("email", "EMAIL"), ("app_password", "APP_PASSWORD")):
+legacy_secrets_found = any(key in saved_extras for key in (
+    "app_password", "calendar_url", "google_calendar_credentials"))
+for stored_key, global_key in (("google_oauth_credentials", "GOOGLE_OAUTH_CREDENTIALS_JSON"),
+                               ("email", "EMAIL")):
     raw_value = saved_extras.get(stored_key, "")
+    if not raw_value and stored_key == "google_oauth_credentials":
+        raw_value = saved_extras.get("google_calendar_credentials", "")
+        if raw_value:
+            legacy_secrets_found = True
     if raw_value:
         try:
             globals()[global_key] = unprotect_secret(raw_value)
@@ -784,8 +797,11 @@ for stored_key, global_key in (("calendar_url", "CALENDAR_URL"),
                 legacy_secrets_found = True
         except Exception as e:
             print(f"(Couldn't decrypt saved {stored_key}: {e})")
-if EMAIL and APP_PASSWORD:
-    EMAIL_ENABLED = True
+try:
+    saved_scopes = json.loads(GOOGLE_OAUTH_CREDENTIALS_JSON).get("scope", "").split()
+    EMAIL_ENABLED = bool(EMAIL and "https://www.googleapis.com/auth/gmail.metadata" in saved_scopes)
+except Exception:
+    EMAIL_ENABLED = False
 if legacy_secrets_found:
     save_settings()
 
@@ -1261,11 +1277,8 @@ def fresh_angle():
 
 # ---------------------------------------------------------------------
 # 9b. GOOGLE CALENDAR: a look at today's appointments, once a day
-# The first time Pixel starts each day, he reads your calendar and gives you a
-# quick rundown. This readout uses the "Secret address in iCal format" that Google gives
-# each calendar (Calendar settings > your calendar > Integrate calendar), so
-# there's no Google sign-in or developer account to set up.
-# Needs: pip install icalendar recurring-ical-events
+# The first time Pixel starts each day, she reads events through the same
+# Google OAuth connection used by the create-event tool.
 # Only titles, times and places are used (never descriptions or guest lists),
 # and they're treated as untrusted text, because other people can invite you to events.
 # ---------------------------------------------------------------------
@@ -1289,6 +1302,8 @@ def save_state(state):
 
 
 GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events.owned"
+GOOGLE_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.metadata"
+GOOGLE_OAUTH_SCOPES = (GOOGLE_CALENDAR_SCOPE, GOOGLE_GMAIL_SCOPE)
 GOOGLE_OAUTH_AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_OAUTH_TOKEN_URI = "https://oauth2.googleapis.com/token"
 GOOGLE_CALENDAR_API = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
@@ -1296,7 +1311,7 @@ GOOGLE_CALENDAR_LOCK = threading.RLock()
 
 
 def google_oauth_login(client_secrets_path):
-    """Run Google's installed-app OAuth flow and return token data for DPAPI storage."""
+    """Run Google's installed-app OAuth flow for calendar and Gmail metadata access."""
     with open(client_secrets_path, "r", encoding="utf-8") as f:
         config = json.load(f)
     installed = config.get("installed") or {}
@@ -1321,7 +1336,7 @@ def google_oauth_login(client_secrets_path):
                 body = b"Sign-in was cancelled. You can close this window."
             else:
                 result["code"] = query.get("code", [""])[0]
-                body = b"Pixel is connected to Google Calendar. You can close this window and return to Pixel."
+                body = b"Pixel is connected to Google. You can close this window and return to Pixel."
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -1336,9 +1351,9 @@ def google_oauth_login(client_secrets_path):
     redirect_uri = f"http://127.0.0.1:{server.server_port}/"
     auth_url = GOOGLE_OAUTH_AUTH_URI + "?" + urllib.parse.urlencode({
         "client_id": client_id, "redirect_uri": redirect_uri, "response_type": "code",
-        "scope": GOOGLE_CALENDAR_SCOPE, "access_type": "offline", "prompt": "consent",
+        "scope": " ".join(GOOGLE_OAUTH_SCOPES), "access_type": "offline", "prompt": "consent",
         "state": state, "code_challenge": challenge, "code_challenge_method": "S256"})
-    ui_events.put(("idle", "Google sign-in opened in your browser. Sign in and allow Pixel to create calendar events."))
+    ui_events.put(("idle", "Google sign-in opened in your browser. Approve Google Calendar and Gmail metadata access."))
     webbrowser.open(auth_url, new=2)
     try:
         server.handle_request()
@@ -1363,16 +1378,25 @@ def google_oauth_login(client_secrets_path):
         "client_id": client_id, "client_secret": client_secret,
         "access_token": token["access_token"], "refresh_token": token["refresh_token"],
         "expires_at": time.time() + float(token.get("expires_in", 3600)),
-        "scope": token.get("scope", GOOGLE_CALENDAR_SCOPE)})
+        "scope": token.get("scope", " ".join(GOOGLE_OAUTH_SCOPES))})
+
+
+def google_gmail_scope_granted():
+    """Whether the saved Google grant includes metadata-only Gmail access."""
+    try:
+        scopes = json.loads(GOOGLE_OAUTH_CREDENTIALS_JSON).get("scope", "").split()
+        return GOOGLE_GMAIL_SCOPE in scopes
+    except Exception:
+        return False
 
 
 def get_google_access_token():
     """Return a valid access token, refreshing and DPAPI-saving it when needed."""
-    global GOOGLE_CALENDAR_CREDENTIALS_JSON
-    if not GOOGLE_CALENDAR_CREDENTIALS_JSON:
-        raise RuntimeError("Google Calendar event creation isn't connected yet. Right-click Pixel and choose 'Connect Google Calendar for events'.")
+    global GOOGLE_OAUTH_CREDENTIALS_JSON
+    if not GOOGLE_OAUTH_CREDENTIALS_JSON:
+        raise RuntimeError("Google isn't connected yet. Right-click Pixel and choose 'Connect Google account'.")
     with GOOGLE_CALENDAR_LOCK:
-        credentials = json.loads(GOOGLE_CALENDAR_CREDENTIALS_JSON)
+        credentials = json.loads(GOOGLE_OAUTH_CREDENTIALS_JSON)
         if float(credentials.get("expires_at", 0)) > time.time() + 60:
             return credentials["access_token"]
         form = urllib.parse.urlencode({
@@ -1384,7 +1408,7 @@ def get_google_access_token():
             token = json.loads(response.read().decode("utf-8"))
         credentials["access_token"] = token["access_token"]
         credentials["expires_at"] = time.time() + float(token.get("expires_in", 3600))
-        GOOGLE_CALENDAR_CREDENTIALS_JSON = json.dumps(credentials)
+        GOOGLE_OAUTH_CREDENTIALS_JSON = json.dumps(credentials)
         save_settings()
         return credentials["access_token"]
 
@@ -1392,72 +1416,91 @@ def get_google_access_token():
 def start_google_calendar_setup():
     """Pick a Google Desktop OAuth client JSON, then authorize Pixel in the browser."""
     messagebox.showinfo(
-        "Connect Google Calendar",
-        "To enable event creation, choose a Google OAuth client JSON for a Desktop app. "
-        "In Google Cloud, enable the Google Calendar API, create an OAuth client ID (Desktop app), "
-        "and download its JSON file. Google will then ask you to sign in and grant Pixel permission "
-        "to create events on your primary calendar.", parent=root)
+        "Connect Google account",
+        "To connect Google Calendar and Gmail, choose your Google OAuth client JSON for a Desktop app. "
+        "In Google Cloud, enable the Google Calendar API and Gmail API, create an OAuth client ID "
+        "(Desktop app), and download its JSON file. Google will ask you to approve calendar access "
+        "and Gmail metadata access (sender, subject, and unread status only; Pixel does not fetch message bodies).",
+        parent=root)
     path = filedialog.askopenfilename(
         parent=root, title="Select Google Desktop OAuth client JSON",
         filetypes=[("Google OAuth client JSON", "*.json"), ("All files", "*.*")])
     if not path:
         return
-    set_bubble("Connecting to Google Calendar. I'll open a sign-in page in your browser...", seconds=15)
+    set_bubble("Connecting your Google account. I'll open a sign-in page in your browser...", seconds=15)
 
     def authorize():
-        global GOOGLE_CALENDAR_CREDENTIALS_JSON
+        global GOOGLE_OAUTH_CREDENTIALS_JSON, EMAIL_ENABLED
         try:
             authorized = google_oauth_login(path)
-            GOOGLE_CALENDAR_CREDENTIALS_JSON = authorized
+            GOOGLE_OAUTH_CREDENTIALS_JSON = authorized
             save_settings()
-            ui_events.put(("happy", "Google Calendar is connected! I can add events to your primary calendar now."))
+            state = load_state()
+            state.pop("calendar_checked", None)
+            save_state(state)
+            threading.Thread(target=calendar_job, daemon=True).start()
+            EMAIL_ENABLED = bool(EMAIL and google_gmail_scope_granted())
+            ui_events.put(("happy", "Google is connected! I'll check today's schedule and can add events. "
+                                   "If you set up email, I'll check unread message headers too."))
+            if EMAIL_ENABLED:
+                threading.Thread(target=mail_job, daemon=True).start()
         except Exception as e:
-            ui_events.put(("idle", f"(Google Calendar setup failed: {e})"))
+            ui_events.put(("idle", f"(Google account setup failed: {e})"))
 
     threading.Thread(target=authorize, daemon=True).start()
 
 
 def todays_events():
-    """Downloads the calendar and returns today's remaining events as short lines of text."""
-    import icalendar, recurring_ical_events        # imported here so Pixel still runs if they aren't installed
-    url = CALENDAR_URL.strip().replace("webcal://", "https://", 1)
-    with urllib.request.urlopen(url, timeout=20) as response:
-        calendar = icalendar.Calendar.from_ical(response.read())
-
+    """Reads today's remaining primary-calendar events through Google OAuth."""
     now = datetime.datetime.now().astimezone()
-    items = []
-    # recurring_ical_events expands repeating events (like "every Monday") into today's occurrences.
-    for event in recurring_ical_events.of(calendar).at(datetime.date.today()):
-        if str(event.get("STATUS", "")).upper() == "CANCELLED":
-            continue
-        start = event.get("DTSTART").dt
-        end_prop = event.get("DTEND")
-        end = end_prop.dt if end_prop else start
-        title = str(event.get("SUMMARY", "(no title)"))[:80]
-        place = str(event.get("LOCATION", ""))[:60]
+    local_tz = now.tzinfo
+    today = now.date()
+    day_start = datetime.datetime.combine(today, datetime.time.min, tzinfo=local_tz)
+    day_end = day_start + datetime.timedelta(days=1)
+    query = urllib.parse.urlencode({
+        "timeMin": day_start.isoformat(), "timeMax": day_end.isoformat(),
+        "singleEvents": "true", "orderBy": "startTime", "maxResults": "50",
+        "fields": "items(summary,location,start,end,status)"})
+    request = urllib.request.Request(
+        GOOGLE_CALENDAR_API + "?" + query,
+        headers={"Authorization": "Bearer " + get_google_access_token(),
+                 "Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=25) as response:
+        events = json.loads(response.read().decode("utf-8")).get("items", [])
 
-        if isinstance(start, datetime.datetime):               # a timed event
-            start = start.astimezone()                         # convert to your local time
-            end = end.astimezone() if isinstance(end, datetime.datetime) else start
+    items = []
+    for event in events:  # singleEvents=true expands recurring events into today's occurrences
+        if str(event.get("status", "")).lower() == "cancelled":
+            continue
+        start_data, end_data = event.get("start", {}), event.get("end", {})
+        title = str(event.get("summary", "(no title)"))[:80]
+        place = str(event.get("location", ""))[:60]
+        if start_data.get("dateTime"):
+            start = datetime.datetime.fromisoformat(start_data["dateTime"].replace("Z", "+00:00")).astimezone()
+            end_raw = end_data.get("dateTime", start_data["dateTime"])
+            end = datetime.datetime.fromisoformat(end_raw.replace("Z", "+00:00")).astimezone()
             if end < now:
-                continue                                       # already finished today
+                continue
             when = f"{start:%H:%M}-{end:%H:%M}"
             sort_key = start
-        else:                                                  # an all-day event
+        elif start_data.get("date"):
+            start = datetime.date.fromisoformat(start_data["date"])
+            if start > today:
+                continue
             when = "All day"
-            sort_key = datetime.datetime.combine(start, datetime.time.min).astimezone()
-
+            sort_key = datetime.datetime.combine(start, datetime.time.min, tzinfo=local_tz)
+        else:
+            continue
         line = f"{when}: {title}" + (f" (at {place})" if place else "")
         items.append((sort_key, line))
-
     items.sort(key=lambda pair: pair[0])
-    return [line for _, line in items][:15]                    # no more than 15 events
+    return [line for _, line in items][:15]
 
 
 def calendar_job():
     """Background job at startup: once per day, reads today's appointments
     and has Pixel give a friendly rundown."""
-    if not CALENDAR_URL.strip():
+    if not GOOGLE_OAUTH_CREDENTIALS_JSON:
         return                                                 # calendar turned off
     setup_done.wait()                                          # wait until the model is ready
     state = load_state()
@@ -1466,10 +1509,6 @@ def calendar_job():
         return                                                 # already did this today
     try:
         lines = todays_events()
-    except ImportError:
-        ui_events.put(("idle", "For the calendar I need two extras. In Command Prompt run: "
-                               "pip install icalendar recurring-ical-events"))
-        return
     except Exception as e:
         ui_events.put(("idle", f"(I couldn't read your calendar: {e})"))
         return                                                 # not marked as done, so he'll try again next start
@@ -2425,7 +2464,7 @@ input_frame = tk.Frame(root, bg="#2b2b3c", padx=6, pady=6)
 entry = tk.Entry(input_frame, font=("Segoe UI", 11), width=28)
 entry.pack(side="left")
 
-entry_mode = "chat"     # what the typing box is for right now: "chat", "calendar", "email_address" or "email_password"
+entry_mode = "chat"     # what the typing box is for right now: "chat" or "email_address"
 
 
 def hide_input(event=None):
@@ -2441,45 +2480,38 @@ def show_input(event=None, mode="chat"):
     """Opens the typing box. `mode` says what it's for (chat by default)."""
     global entry_mode
     entry_mode = mode
-    entry.config(show="•" if mode == "email_password" else "")   # hide the characters when typing a password
+    entry.config(show="")
     entry.delete(0, "end")
     input_frame.place(x=20, y=FACE_TOP + FACE_H + 8)
     entry.focus_force()          # windows without a title bar need focus to be forced
 
 
-# --- Setting up the calendar and email from the right-click menu ---
-# Instead of editing the script, you paste your details into the typing box.
-# Secrets are protected with Windows DPAPI for the current Windows account.
-OFF_WORDS = ("off", "remove", "none", "clear")      # type one of these at a setup step to turn the feature off
-pending_email = {"address": ""}                     # holds the address while we wait for the password
-
-
-def start_calendar_setup():
-    """Menu item: asks for your Google Calendar secret iCal address."""
-    set_bubble("Paste your Google Calendar 'Secret address in iCal format' and press Enter. "
-               "(Google Calendar > Settings > your calendar > Integrate calendar.) "
-               "Type off to turn the calendar off. Escape cancels.", seconds=120)
-    show_input(mode="calendar")
+# --- Setting up Google services and email from the right-click menu ---
+# Google OAuth credentials are protected with Windows DPAPI for this account.
+OFF_WORDS = ("off", "remove", "none", "clear")      # type one of these at a setup step to turn email alerts off
 
 
 def start_email_setup():
-    """Menu item: asks for your email address, then your app password."""
-    set_bubble("Email setup: type your email address and press Enter. I'll ask for an app password next. "
-               "Type off to turn email off. Escape cancels.", seconds=120)
+    """Menu item: asks which Gmail inbox Pixel should monitor."""
+    set_bubble("Type your Gmail address and press Enter. Pixel reads unread status, sender, and subject only. "
+               "Type off to turn email alerts off. Connect Google from the menu first if you haven't already.", seconds=120)
     show_input(mode="email_address")
 
 
 def turn_off(what):
-    """Switches the calendar or email feature off and forgets the saved details."""
-    global EMAIL, APP_PASSWORD, EMAIL_ENABLED, CALENDAR_URL, GOOGLE_CALENDAR_CREDENTIALS_JSON
+    """Switches email monitoring or all Google-connected features off."""
+    global EMAIL, EMAIL_ENABLED, GOOGLE_OAUTH_CREDENTIALS_JSON
     if what == "email":
-        EMAIL, APP_PASSWORD, EMAIL_ENABLED = "", "", False
+        EMAIL, EMAIL_ENABLED = "", False
     else:
-        CALENDAR_URL = ""
-        GOOGLE_CALENDAR_CREDENTIALS_JSON = ""
+        GOOGLE_OAUTH_CREDENTIALS_JSON = ""
+        EMAIL_ENABLED = False
+        state = load_state()
+        state.pop("calendar_checked", None)
+        save_state(state)
     # Older builds allowed secrets in pixel_config.json. Clear those too so
     # turning a feature off stays effective after a restart.
-    config_key = "EMAIL" if what == "email" else "CALENDAR_URL"
+    config_key = "EMAIL" if what == "email" else None
     extra_config_key = "APP_PASSWORD" if what == "email" else None
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -2499,55 +2531,32 @@ def turn_off(what):
     set_bubble(f"Okay, I've turned {what} off.", seconds=6)
 
 
-def save_calendar(text):
-    """Stores the calendar address you pasted, and reads your day right away."""
-    global CALENDAR_URL
-    url = text.strip().replace("webcal://", "https://", 1)
-    if not url.startswith("https://"):
-        set_bubble("That doesn't look like a calendar address. It should start with https:// or webcal://. "
-                   "Try again from the menu.", seconds=10)
+def save_email(address):
+    """Stores the Gmail address and checks it if OAuth metadata access is connected."""
+    global EMAIL, EMAIL_ENABLED
+    EMAIL = address.strip()
+    EMAIL_ENABLED = bool(GOOGLE_OAUTH_CREDENTIALS_JSON and google_gmail_scope_granted())
+    save_settings()
+    if not EMAIL_ENABLED:
+        set_bubble("Gmail address saved. Right-click Pixel and choose Connect Google account to grant Gmail metadata access.", seconds=12)
         return
-    CALENDAR_URL = url
-    save_settings()
-    state = load_state()
-    state.pop("calendar_checked", None)                 # forget today's check so he looks right now
-    save_state(state)
-    set_bubble("Calendar saved! Let me take a look at your day...", seconds=8)
-    threading.Thread(target=calendar_job, daemon=True).start()
-
-
-def save_email(address, password):
-    """Stores the email login you entered, then tries it straight away."""
-    global EMAIL, APP_PASSWORD, EMAIL_ENABLED
-    EMAIL = address
-    APP_PASSWORD = password.replace(" ", "")            # Google shows app passwords in groups with spaces
-    EMAIL_ENABLED = True
-    save_settings()
-    set_bubble("Saved! Let me try logging in and see what's waiting...", seconds=8)
-    threading.Thread(target=mail_job, daemon=True).start()   # doubles as a test of the login
+    set_bubble("Saved! Let me check the unread message headers...", seconds=8)
+    threading.Thread(target=mail_job, daemon=True).start()
 
 
 def finish_setup_step(text):
-    """Handles what you typed while the box is being used for calendar or email setup."""
+    """Handles what you typed while the box is being used for email setup."""
     mode = entry_mode
     hide_input()                                        # closes the box and clears it (including any password)
     if not text:
         return
-    if mode in ("calendar", "email_address") and text.lower() in OFF_WORDS:
-        turn_off("calendar" if mode == "calendar" else "email")
-    elif mode == "calendar":
-        save_calendar(text)
+    if mode == "email_address" and text.lower() in OFF_WORDS:
+        turn_off("email")
     elif mode == "email_address":
         if "@" not in text:
             set_bubble("That doesn't look like an email address. Try again from the menu.", seconds=8)
             return
-        pending_email["address"] = text
-        set_bubble("Now paste your 16-character app password (not your normal password) and press Enter. "
-                   "It will be hidden as you type.", seconds=120)
-        show_input(mode="email_password")
-    elif mode == "email_password":
-        save_email(pending_email["address"], text)
-        pending_email["address"] = ""
+        save_email(text)
 
 
 def send(event=None):
@@ -2895,8 +2904,8 @@ menu.add_cascade(label="⏩ Speed", menu=speed_menu)
 menu.add_separator()
 menu.add_command(label="⚙ Settings...", command=open_settings)
 
-menu.add_command(label="📅 Set up calendar readout...", command=start_calendar_setup)
-menu.add_command(label="🗓 Connect Google Calendar for events...", command=start_google_calendar_setup)
+menu.add_command(label="🗓 Connect Google account...", command=start_google_calendar_setup)
+menu.add_command(label="Disconnect Google account", command=lambda: turn_off("calendar"))
 menu.add_command(label="✉ Set up email...", command=start_email_setup)
 menu.add_command(label="▶ Test voice", command=lambda: speak("Hi, I'm Pixel. How do I sound?"))
 menu.add_separator()
@@ -2997,6 +3006,6 @@ if VOICE_IN_OK:
     threading.Thread(target=preload_whisper, daemon=True).start() # warm up speech recognition
 setup_hotkey()                                           # start listening for the talk key
 poll()                                                   # start checking for updates
-threading.Thread(target=calendar_job, daemon=True).start()   # once-a-day calendar rundown (if a calendar address is set)
+threading.Thread(target=calendar_job, daemon=True).start()   # once-a-day rundown (if Google Calendar is connected)
 root.mainloop()                                          # run the window until you close it
 # ("daemon=True" means the background jobs stop automatically when you close the window.)
