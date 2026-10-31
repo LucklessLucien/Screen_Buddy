@@ -18,8 +18,9 @@
 # Pixel reports the problem; he never pretends the action succeeded.
 #
 # CUSTOM FACES: each character pack in pixel_packs has its own "faces" folder
-# containing transparent PNG pictures named after moods (idle.png, happy.png,
-# surprised.png, thinking.png, and any others you like). Switch packs from the
+# containing transparent PNG or GIF pictures named after moods (idle.png, happy.gif,
+# surprised.png, thinking.gif, and any others you like). GIFs take priority over PNGs
+# when both exist for the same mood. Switch packs from the
 # right-click menu to change Pixel's face, voice, and personality together.
 #
 # OPTIONAL EXTRAS: each one is separate, and Pixel works without them.
@@ -402,9 +403,9 @@ EMAIL_ENABLED = bool(EMAIL and GOOGLE_OAUTH_CREDENTIALS_JSON)
 
 
 # ---------------------------------------------------------------------
-# 2b. MOODS: found automatically from the PNG files in your faces folder
-# happy.png in the folder -> Pixel can use the mood "happy".
-# If there are no PNGs, Pixel uses the four built-in drawn moods.
+# 2b. MOODS: found automatically from PNG and GIF files in your faces folder
+# happy.png or happy.gif in the folder -> Pixel can use the mood "happy".
+# If there are no image files, Pixel uses the four built-in drawn moods.
 # Notes: file names can only use letters, numbers and underscores.
 # The program itself uses "idle" (default), "thinking" (while the model
 # is working) and "surprised" (when an alarm goes off). Any that you
@@ -414,13 +415,14 @@ DEFAULT_MOODS = ["idle", "happy", "surprised", "thinking"]
 
 
 def discover_moods():
-    """Looks in the faces folder for PNG files and returns their names (without .png)."""
+    """Find mood names from PNG and GIF assets, without duplicating mixed formats."""
     if not os.path.isdir(FACE_FOLDER):
         return DEFAULT_MOODS
-    found = sorted(f[:-4].lower() for f in os.listdir(FACE_FOLDER)
-                   if f.lower().endswith(".png") and re.fullmatch(r"\w+", f[:-4]))
-    return found or DEFAULT_MOODS
-
+    found = {os.path.splitext(filename)[0].lower()
+             for filename in os.listdir(FACE_FOLDER)
+             if os.path.splitext(filename)[1].lower() in (".png", ".gif")
+             and re.fullmatch(r"\w+", os.path.splitext(filename)[0])}
+    return sorted(found) or DEFAULT_MOODS
 
 EXPRESSIONS = discover_moods()   # the moods Pixel can show
 EXAMPLE_MOOD = "happy" if "happy" in EXPRESSIONS else EXPRESSIONS[0]   # used in the example given to the model
@@ -435,11 +437,13 @@ EXAMPLE_MOOD = "happy" if "happy" in EXPRESSIONS else EXPRESSIONS[0]   # used in
 PERSONALITY_TEMPLATE = (
     "You are __PACK_NAME__, a playful and curious desktop companion who genuinely wants to understand what the user is doing and why. "
     "Automatic check-ins are messages that start with \"Here's my screen now.\" For those, keep it short: one or two sentences. "
-    "Now and then (not every time) make the comment a curious question about what they're working on, "
-    "and never repeat a question you've already asked. "
+    "For automatic screen check-ins, follow the randomly assigned angle in that message. "
+    "Vary between observations, humor, useful tips, encouragement, reactions, and occasional questions. "
+    "Do not turn every check-in into a question or tack on an automatic follow-up question. "
+    "Ask a question during a check-in only when its assigned angle specifically asks for one. "
     "When the user talks to you or asks something, answer it properly. Give as much detail as the question needs: "
     "a sentence or two for simple things, and a few short paragraphs when something needs explaining. "
-    "Don't pad or repeat yourself. After a full answer you may add one short follow-up question if it would help. "
+    "Don't pad or repeat yourself. In direct replies to the user, you may add one short follow-up question after a full answer if it would help. "
     "Your replies are shown in a small speech bubble and may be read aloud, so write plain flowing sentences: "
     "no emoji, markdown, bullet lists or unusual symbols. "
     "Always begin your reply with exactly one mood marker chosen from: __MOODS__. "
@@ -1238,15 +1242,14 @@ threading.Thread(target=first_run_setup, daemon=True).start()
 # Each automatic comment is given a different "angle", so Pixel doesn't fall into a rut.
 AUTO_ANGLES = [
     "Ask one curious question about what they seem to be working on, or why.",
-    "Make a short, light joke or playful remark about it.",
-    "Share one quick, genuinely useful tip related to what they're doing.",
-    "Give a short, honest reaction or opinion, the way a friend would.",
-    "Point out one small detail you noticed, without describing the rest of the screen.",
-    "Offer a short word of encouragement, or a gentle nudge if they've been at it a while.",
-    "Share a fun or surprising fact related to what's on screen.",
-    "Wonder aloud about something connected to it, in one sentence.",
+    "Make a short, light joke or playful observation. Don't force a punchline.",
+    "Share one fun or surprising fact that is relevant and you know to be true; otherwise make a simple observation.",
+    "Offer one quick, genuinely useful tip related to what is visible.",
+    "Give a short, honest reaction or opinion, like a friend would. Don't ask a question.",
+    "Point out one small specific detail without describing the whole screen. Don't ask a question.",
+    "Offer a brief word of encouragement or a gentle nudge. Don't ask a question.",
+    "Make a brief connection or analogy related to what's visible. Don't ask a question.",
 ]
-
 
 def recent_openings(count=6):
     """The first few words of Pixel's most recent comments, so we can tell him
@@ -1267,8 +1270,10 @@ def recent_openings(count=6):
 def fresh_angle():
     """Builds the extra instruction added to every automatic check-in:
     a random angle for this comment, plus a list of openings to avoid."""
-    text = (f"This time: {random.choice(AUTO_ANGLES)} Keep it to one or two sentences. "
-            "Don't start with \"I see\" or \"It looks like\", and don't just describe the screen.")
+    text = (f"This check-in's assigned angle: {random.choice(AUTO_ANGLES)} "
+            "Use that angle for one or two sentences. Do not add an automatic follow-up question; "
+            "ask one only if the assigned angle explicitly tells you to. "
+            "Don't start with \"I see\" or \"It looks like\", and don't just narrate the whole screen.")
     avoid = recent_openings()
     if avoid:
         text += " Don't begin with any of the openings you've used recently: " + "; ".join(f'"{a}"' for a in avoid) + "."
@@ -2338,29 +2343,40 @@ canvas = tk.Canvas(root, width=WIN_W, height=FACE_H, bg=TRANSPARENT, highlightth
 canvas.place(x=0, y=FACE_TOP)
 
 
-# --- Face pictures: loaded ONCE at startup, then simply swapped ---
-face_images = {}      # mood name -> a ready-to-show picture
+# --- Face pictures: loaded once at startup; GIFs animate only while their mood is active ---
+# Each mood stores a list of Tk images and per-frame display times. If both files
+# exist, the GIF wins; a broken GIF falls back to its PNG.
+face_images = {}      # mood -> (PhotoImage frames, frame durations in milliseconds)
+face_animation_job = None
+face_animation_token = 0
 
 
 def load_faces():
-    """Loads every mood's PNG from the faces folder, shrinks it to fit,
-    and keeps it in memory so changing moods later costs almost nothing."""
+    """Loads each mood's GIF (preferred) or PNG and shrinks it to fit."""
     for mood in EXPRESSIONS:
-        path = os.path.join(FACE_FOLDER, mood + ".png")
-        if not os.path.exists(path):
-            continue                                   # no PNG for this mood (e.g. using the drawn face)
-        try:
-            img = Image.open(path).convert("RGBA")     # RGBA = color plus transparency
-            img.thumbnail((FACE_W, FACE_H), Image.LANCZOS)   # shrink to fit; never stretches
-            if PNG_HARD_EDGES:
-                # Make every pixel either fully see-through or fully solid.
-                # Half-see-through edge pixels would blend with the invisible
-                # color and show up as a dark outline.
-                alpha = img.getchannel("A").point(lambda a: 255 if a >= 128 else 0)
-                img.putalpha(alpha)
-            face_images[mood] = ImageTk.PhotoImage(img)   # keep a reference so it isn't discarded
-        except Exception as e:
-            print(f"(Couldn't load {path}: {e})")
+        candidates = [os.path.join(FACE_FOLDER, mood + ext) for ext in (".gif", ".png")]
+        for path in candidates:
+            if not os.path.exists(path):
+                continue
+            try:
+                frames, durations = [], []
+                with Image.open(path) as source:
+                    is_gif = path.lower().endswith(".gif")
+                    frame_count = getattr(source, "n_frames", 1) if is_gif else 1
+                    for frame_index in range(frame_count):
+                        source.seek(frame_index)
+                        img = source.convert("RGBA")
+                        img.thumbnail((FACE_W, FACE_H), Image.LANCZOS)
+                        if PNG_HARD_EDGES and not is_gif:
+                            # Preserve the established hard-edge treatment for PNGs.
+                            alpha = img.getchannel("A").point(lambda a: 255 if a >= 128 else 0)
+                            img.putalpha(alpha)
+                        frames.append(ImageTk.PhotoImage(img))
+                        durations.append(max(20, int(source.info.get("duration", 100))))
+                face_images[mood] = (frames, durations)
+                break  # GIF first means GIF priority when both files exist
+            except Exception as e:
+                print(f"(Couldn't load {path}: {e})")
 
 
 load_faces()
@@ -2368,30 +2384,55 @@ if face_images:
     print("Loaded faces:", ", ".join(face_images))
     face_item = canvas.create_image(WIN_W // 2, FACE_H // 2, anchor="center")   # one picture slot we swap into
 else:
-    print(f"(No PNG faces found in {FACE_FOLDER}, so Pixel is using the drawn face.)")
+    print(f"(No PNG or GIF faces found in {FACE_FOLDER}, so Pixel is using the drawn face.)")
     face_item = None
 
 current_face = None   # remembers which mood is showing, so we skip redundant work
 
 
+def stop_face_animation():
+    """Cancel the current mood's frame timer and invalidate any queued callback."""
+    global face_animation_job, face_animation_token
+    face_animation_token += 1
+    if face_animation_job is not None:
+        try:
+            root.after_cancel(face_animation_job)
+        except Exception:
+            pass
+        face_animation_job = None
+
+
+def show_face_frame(mood, index, token):
+    """Show one frame, then schedule the next while this mood remains active."""
+    global face_animation_job
+    if token != face_animation_token or current_face is None or face_item is None:
+        return
+    frames, durations = face_images[mood]
+    index %= len(frames)
+    canvas.itemconfig(face_item, image=frames[index])
+    face_animation_job = None
+    if len(frames) > 1:
+        next_index = (index + 1) % len(frames)
+        face_animation_job = root.after(
+            durations[index], lambda: show_face_frame(mood, next_index, token))
+
+
 def draw_face(expr):
-    """Shows the face for the given mood. If that mood is already showing,
-    nothing happens. With PNGs it just swaps pictures; without them it
-    draws the built-in face."""
+    """Show the selected mood; animated GIF frames play until the mood changes."""
     global current_face
     if expr == current_face:
         return
+    stop_face_animation()
     current_face = expr
     if face_item is not None:
-        # Use this mood's picture, or fall back to "idle", or to any picture we have.
-        pic = face_images.get(expr) or face_images.get("idle") or next(iter(face_images.values()))
-        canvas.itemconfig(face_item, image=pic)
+        # Use this mood, or fall back to idle, or to any image available in the pack.
+        mood = expr if expr in face_images else "idle" if "idle" in face_images else next(iter(face_images))
+        show_face_frame(mood, 0, face_animation_token)
     else:
         draw_shapes(expr)
 
-
 def draw_shapes(expr):
-    """The built-in drawn face, used only when there are no PNGs.
+    """The built-in drawn face, used only when there are no PNG or GIF assets.
     To add a drawn mood: add its name to DEFAULT_MOODS and add an elif branch here."""
     canvas.delete("all")
     # The head (same for every mood). Coordinates are (left, top, right, bottom).
