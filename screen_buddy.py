@@ -54,6 +54,7 @@ import threading          # lets several jobs run at the same time
 import queue              # thread-safe "mailboxes" to pass messages between jobs
 import urllib.parse       # picks apart web addresses so we can check them
 import random             # picks a different "angle" for each automatic comment
+import subprocess        # optional Windows thermal sensor query
 import secrets            # creates OAuth state and PKCE values
 import hashlib            # creates the OAuth PKCE challenge
 import base64             # encodes the OAuth PKCE challenge
@@ -68,6 +69,13 @@ import mss                # takes screenshots
 import ollama             # talks to your local model through Ollama
 from PIL import Image, ImageTk   # (Pillow) resizes screenshots and loads the face PNGs
 from ctypes import wintypes
+
+try:
+    import psutil          # reads CPU and memory use (also temperature where supported)
+    PERFORMANCE_MONITOR_OK = True
+except ImportError:
+    psutil = None
+    PERFORMANCE_MONITOR_OK = False
 
 
 def write_json_atomic(path, value, *, indent=None, ensure_ascii=True):
@@ -180,6 +188,20 @@ if FROZEN:
 else:
     DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# PyCaw is bundled locally so the packaged app can inspect Windows audio sessions.
+VENDOR_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "vendor")
+if os.path.isdir(VENDOR_DIR):
+    sys.path.insert(0, VENDOR_DIR)
+
+try:
+    from pycaw.pycaw import AudioUtilities, IAudioMeterInformation
+    from pycaw.constants import AudioSessionState, DEVICE_STATE, EDataFlow
+    AUDIO_SESSION_MONITOR_OK = True
+except Exception as e:
+    AudioUtilities = AudioSessionState = None
+    AUDIO_SESSION_MONITOR_OK = False
+    print(f"(App-specific audio quieting is unavailable: {e})")
+
 # --- Optional libraries ---
 # "try/except ImportError" means: try to load it, and if it isn't installed,
 # don't crash. Just remember that the feature is unavailable.
@@ -221,6 +243,14 @@ THINKING = False                 # False = skip the model's "thinking" phase (mu
 CHANGE_THRESHOLD = 3             # how different the screen must look before Pixel comments on his own.
                                  # Lower = chattier (try 1-2), higher = quieter (try 5-10), 0 = always comment.
 INTERVAL = 60                    # seconds of silence before Pixel comments on his own
+PERFORMANCE_MONITOR_ENABLED = True
+PERFORMANCE_CHECK_INTERVAL = 30  # seconds between performance samples
+PERFORMANCE_CPU_LIMIT = 90       # comment after sustained use at or above this percent
+PERFORMANCE_MEMORY_LIMIT = 90    # comment after sustained use at or above this percent
+PERFORMANCE_TEMPERATURE_LIMIT = 80  # Celsius; uses a supported hardware thermal sensor
+AUDIO_AVOID_APPS = ["chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+                    "vivaldi.exe", "opera.exe", "opera_gx.exe", "chromium.exe",
+                    "arc.exe", "discord.exe"]
 MAIL_CHECK_MINUTES = 5           # how often to look for new email
 SAVE_HISTORY = True              # True = remember conversations between sessions
 MAX_SAVED = 200                  # how many recent messages to keep in the save file
@@ -344,7 +374,9 @@ GOOGLE_OAUTH_CREDENTIALS_JSON = ""  # DPAPI-protected Google OAuth credentials
 CONFIG_FILE = os.path.join(DATA_DIR, "pixel_config.json")
 CONFIGURABLE = ["MODEL", "MAX_TOOL_ROUNDS", "MONITOR", "IMAGE_SIZE", "THINKING", "CHANGE_THRESHOLD",
                 "INTERVAL", "MAIL_CHECK_MINUTES", "OPACITY", "SPEAK_REPLIES", "SPEAK_AUTO_COMMENTS", "KOKORO_VOICE",
-                "KOKORO_SPEED", "TALK_KEY", "TALK_MODE", "WHISPER_MODEL", "WHISPER_LANGUAGE"]
+                "KOKORO_SPEED", "TALK_KEY", "TALK_MODE", "WHISPER_MODEL", "WHISPER_LANGUAGE",
+                "PERFORMANCE_MONITOR_ENABLED", "PERFORMANCE_CHECK_INTERVAL", "PERFORMANCE_CPU_LIMIT",
+                "PERFORMANCE_MEMORY_LIMIT", "PERFORMANCE_TEMPERATURE_LIMIT", "AUDIO_AVOID_APPS"]
 SECRET_CONFIG_KEYS = {"EMAIL": "email"}
 
 
@@ -367,6 +399,10 @@ def apply_config_file():
                     migrated = True
             for key, value in config.items():
                 if key in CONFIGURABLE:                         # only known settings are accepted
+                    if key == "AUDIO_AVOID_APPS":
+                        if not isinstance(value, list):
+                            value = []
+                        value = [os.path.basename(str(app)).casefold() for app in value if str(app).strip()]
                     globals()[key] = tuple(value) if key == "IMAGE_SIZE" else value
                 elif key in SECRET_CONFIG_KEYS:                 # migrate older plain-text secrets
                     try:
@@ -746,7 +782,7 @@ def load_settings():
             "pack": saved.get("pack")}
 
 
-def save_settings():
+def save_settings(*, raise_errors=False):
     """Saves voice preferences and DPAPI-protected Google/email credentials."""
     try:
         stored = dict(settings)  # voice choices are ordinary preferences
@@ -757,7 +793,8 @@ def save_settings():
                 stored[key] = protect_secret(value)
         write_json_atomic(SETTINGS_FILE, stored, indent=2)
     except Exception:
-        pass
+        if raise_errors:
+            raise
 
 
 settings = load_settings()      # active character and voice preferences
@@ -811,6 +848,8 @@ if legacy_secrets_found:
 
 kokoro = None                   # the natural voice engine, once it has loaded
 interrupt = threading.Event()   # when set, Pixel stops whatever she's saying
+SELECTED_APP_AUDIO_ACTIVE = threading.Event()  # pauses Pixel's voice while selected apps make sound
+APP_AUDIO_LAST_ERROR = None
 
 
 def ensure_kokoro_files():
@@ -891,8 +930,25 @@ def speak_with_kokoro(text):
         if item is None:
             break
         samples, sample_rate = item
-        sd.play(samples, sample_rate)        # start playing...
-        sd.wait()                            # ...and wait until it's done (or sd.stop() is called)
+        # Wait while selected applications are producing output. If their
+        # audio begins mid-sentence, stop and replay that sentence afterward.
+        while not interrupt.is_set():
+            if SELECTED_APP_AUDIO_ACTIVE.is_set():
+                time.sleep(0.1)
+                continue
+            sd.play(samples, sample_rate)
+            interrupted_by_app = False
+            while not interrupt.is_set():
+                if SELECTED_APP_AUDIO_ACTIVE.is_set():
+                    sd.stop()
+                    interrupted_by_app = True
+                    break
+                stream = sd.get_stream()
+                if stream is None or not stream.active:
+                    break
+                time.sleep(0.05)
+            if interrupt.is_set() or not interrupted_by_app:
+                break
 
 
 _pitch_shifter = None
@@ -2205,6 +2261,173 @@ def chat_with_tools(messages, kind, capture=None):
 
 
 # ---------------------------------------------------------------------
+# 9c. PERFORMANCE WATCHER
+# Samples lightweight system counters and only alerts after two high readings.
+# ---------------------------------------------------------------------
+PERFORMANCE_SETTINGS_CHANGED = threading.Event()
+
+
+def read_temperature_c():
+    """Return the highest available thermal-zone temperature, or None if unsupported."""
+    if psutil is not None:
+        try:
+            for entries in psutil.sensors_temperatures(fahrenheit=False).values():
+                values = [entry.current for entry in entries if entry.current is not None]
+                if values:
+                    return max(values)
+        except Exception:
+            pass
+    if os.name == "nt":
+        # Windows exposes ACPI thermal zones on some, but not all, computers.
+        command = ("$t=Get-CimInstance -Namespace root/wmi -ClassName "
+                   "MSAcpi_ThermalZoneTemperature -ErrorAction Stop | "
+                   "Select-Object -ExpandProperty CurrentTemperature; "
+                   "@($t | ForEach-Object { [math]::Round($_ / 10 - 273.15, 1) }) | "
+                   "ConvertTo-Json -Compress")
+        try:
+            result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+                                    capture_output=True, text=True, timeout=4, creationflags=0x08000000)
+            if result.returncode == 0 and result.stdout.strip():
+                values = json.loads(result.stdout.strip())
+                if not isinstance(values, list):
+                    values = [values]
+                values = [float(value) for value in values if value is not None]
+                if values:
+                    return max(values)
+        except Exception:
+            pass
+    return None
+
+
+def iter_output_audio_sessions():
+    """Yield sessions on active output devices, including non-default headsets."""
+    from pycaw.api.audiopolicy import IAudioSessionControl2
+    from pycaw.utils import AudioSession
+    for device in AudioUtilities.GetAllDevices(data_flow=EDataFlow.eRender.value,
+                                                device_state=DEVICE_STATE.ACTIVE.value):
+        manager = device.AudioSessionManager
+        if manager is None:
+            continue
+        enumerator = manager.GetSessionEnumerator()
+        for index in range(enumerator.GetCount()):
+            control = enumerator.GetSession(index)
+            if control is None:
+                continue
+            control2 = control.QueryInterface(IAudioSessionControl2)
+            if control2 is not None:
+                yield AudioSession(control2)
+
+
+def discover_audio_applications():
+    """Return process names for apps that have a session on an active output device."""
+    if not AUDIO_SESSION_MONITOR_OK:
+        return []
+    try:
+        found = set()
+        for session in iter_output_audio_sessions():
+            process = session.Process
+            if process is not None and session.State != AudioSessionState.Expired:
+                found.add(os.path.basename(process.name()).casefold())
+        return sorted(found)
+    except Exception as e:
+        print(f"(Couldn't list audio applications: {e})")
+        return []
+
+
+def selected_application_audio_is_active():
+    """Check selected process sessions for active audio output, not microphone input."""
+    global APP_AUDIO_LAST_ERROR
+    selected = set(AUDIO_AVOID_APPS)
+    if not selected or not AUDIO_SESSION_MONITOR_OK:
+        return False
+    try:
+        for session in iter_output_audio_sessions():
+            process = session.Process
+            if process is None or os.path.basename(process.name()).casefold() not in selected:
+                continue
+            if session.State != AudioSessionState.Active:
+                continue
+            try:
+                meter = session._ctl.QueryInterface(IAudioMeterInformation)
+                peak = meter.GetPeakValue()
+                if isinstance(peak, tuple):
+                    peak = peak[-1]
+                if float(peak) > 0.005:
+                    APP_AUDIO_LAST_ERROR = None
+                    return True
+            except Exception:
+                # If the driver has no per-session meter, active stream state
+                # is the best indication the app is playing audio.
+                APP_AUDIO_LAST_ERROR = None
+                return True
+        APP_AUDIO_LAST_ERROR = None
+        return False
+    except Exception as e:
+        if str(e) != APP_AUDIO_LAST_ERROR:
+            print(f"(App audio check failed: {e})")
+            APP_AUDIO_LAST_ERROR = str(e)
+        return False
+
+
+def application_audio_watcher():
+    """Keep a flag current while any selected application produces audible output."""
+    if not AUDIO_SESSION_MONITOR_OK:
+        print("(App-specific quieting needs the Windows audio-session support.)")
+        return
+    while True:
+        try:
+            if selected_application_audio_is_active():
+                SELECTED_APP_AUDIO_ACTIVE.set()
+            else:
+                SELECTED_APP_AUDIO_ACTIVE.clear()
+        except Exception as e:
+            print(f"(App audio monitor unavailable: {e})")
+            SELECTED_APP_AUDIO_ACTIVE.clear()
+        time.sleep(0.2)
+
+
+def performance_watcher():
+    """Queue an occasional Pixel comment when CPU, memory, or a sensor stays high."""
+    if not PERFORMANCE_MONITOR_OK:
+        print("(Computer performance monitoring needs psutil; install it with: pip install psutil)")
+        return
+    psutil.cpu_percent(interval=None)  # prime the non-blocking CPU counter
+    high_counts = {}
+    active_alerts = set()
+    while True:
+        if PERFORMANCE_SETTINGS_CHANGED.wait(timeout=max(1, int(PERFORMANCE_CHECK_INTERVAL))):
+            PERFORMANCE_SETTINGS_CHANGED.clear()
+            continue
+        if not PERFORMANCE_MONITOR_ENABLED:
+            continue
+        try:
+            cpu = psutil.cpu_percent(interval=None)
+            memory = psutil.virtual_memory().percent
+            temperature = read_temperature_c()
+            values = {"CPU": (cpu, PERFORMANCE_CPU_LIMIT, "%"),
+                      "memory": (memory, PERFORMANCE_MEMORY_LIMIT, "%")}
+            if temperature is not None:
+                values["temperature"] = (temperature, PERFORMANCE_TEMPERATURE_LIMIT, "°C")
+            currently_high = {name for name, (value, limit, _) in values.items() if value >= limit}
+            for name in list(high_counts):
+                if name not in currently_high:
+                    high_counts.pop(name, None)
+                    active_alerts.discard(name)
+            newly_high = []
+            for name in currently_high:
+                high_counts[name] = high_counts.get(name, 0) + 1
+                if high_counts[name] >= 2 and name not in active_alerts:
+                    active_alerts.add(name)
+                    newly_high.append(name)
+            if newly_high:
+                details = ", ".join(f"{name}: {values[name][0]:.0f}{values[name][2]}"
+                                     for name in sorted(currently_high))
+                user_msgs.put(("performance", details))
+        except Exception as e:
+            print(f"(Performance monitor sample failed: {e})")
+
+
+# ---------------------------------------------------------------------
 # 9d. THE WORKER: the background job that talks to the model
 # It waits for messages. If nothing arrives within INTERVAL seconds,
 # it treats the silence as "time for a screen comment", but only if the
@@ -2242,6 +2465,10 @@ def worker():
                     prompt = f"(Time now: {now}) The user says: {text}"
                 elif kind == "mail":
                     prompt = f"(Time now: {now}) {text}"
+                elif kind == "performance":
+                    prompt = (f"(Time now: {now}) Computer performance alert: {text}. "
+                              "Briefly tell the user what is elevated. Keep the tone calm, avoid claiming "
+                              "there is a problem beyond these readings, and do not ask a routine follow-up question.")
                 else:
                     prompt = f"(Time now: {now}) Here's my screen now. {fresh_angle()}"
                 message = {"role": "user", "content": prompt}
@@ -2270,7 +2497,7 @@ def worker():
                 history.append({"role": "user", "content": prompt})
                 history.append({"role": "assistant", "content": reply})
                 history[:] = history[-MAX_SAVED:]     # keep the in-memory list from growing forever
-                if kind != "auto":                    # automatic screen comments are NOT saved to the file
+                if kind not in ("auto", "performance"):  # automatic comments are NOT saved to the file
                     saved_history.append({"role": "user", "content": prompt})
                     saved_history.append({"role": "assistant", "content": reply})
                     save_history()                    # write the conversation to disk
@@ -2289,7 +2516,7 @@ def worker():
 
                 # Ask the window to read it aloud. Automatic screen comments
                 # stay silent unless SPEAK_AUTO_COMMENTS is True.
-                if kind != "auto" or SPEAK_AUTO_COMMENTS:
+                if kind not in ("auto", "performance") or SPEAK_AUTO_COMMENTS:
                     ui_events.put(("speak", spoken))
 
                 # Status lines from tools ("Timer: tea in 5 minutes") go under his reply.
@@ -2751,12 +2978,42 @@ def open_settings():
 
     settings_window = tk.Toplevel(root)
     settings_window.title("Pixel Settings")
-    settings_window.resizable(False, False)
+    settings_window.resizable(True, True)
     settings_window.transient(root)
-    settings_window.protocol("WM_DELETE_WINDOW", lambda: settings_window.destroy())
+    window_height = max(440, min(720, root.winfo_screenheight() - 120))
+    settings_window.geometry(f"600x{window_height}")
+    settings_window.minsize(600, 400)
+    settings_window.grid_columnconfigure(0, weight=1)
+    settings_window.grid_rowconfigure(0, weight=1)
+
+    # Reserve a dedicated footer row so Save and Cancel stay visible at all scroll positions.
+    buttons = ttk.Frame(settings_window, padding=(12, 8, 12, 12))
+    buttons.grid(row=1, column=0, sticky="ew")
+
+    # Keep the settings sections in a scrollable area above the fixed footer.
+    settings_body = ttk.Frame(settings_window)
+    settings_body.grid(row=0, column=0, sticky="nsew")
+    settings_canvas = tk.Canvas(settings_body, highlightthickness=0, borderwidth=0)
+    settings_scrollbar = ttk.Scrollbar(settings_body, orient="vertical", command=settings_canvas.yview)
+    settings_canvas.configure(yscrollcommand=settings_scrollbar.set)
+    settings_scrollbar.pack(side="right", fill="y")
+    settings_canvas.pack(side="left", fill="both", expand=True)
+    settings_content = ttk.Frame(settings_canvas)
+    settings_canvas_window = settings_canvas.create_window((0, 0), window=settings_content, anchor="nw")
+    settings_content.bind(
+        "<Configure>",
+        lambda _event: settings_canvas.configure(scrollregion=settings_canvas.bbox("all")))
+    settings_canvas.bind(
+        "<Configure>",
+        lambda event: settings_canvas.itemconfigure(settings_canvas_window, width=event.width))
 
     interval_var = tk.StringVar(value=str(INTERVAL))
     threshold_var = tk.IntVar(value=int(CHANGE_THRESHOLD))
+    performance_enabled_var = tk.BooleanVar(value=PERFORMANCE_MONITOR_ENABLED)
+    performance_interval_var = tk.StringVar(value=str(PERFORMANCE_CHECK_INTERVAL))
+    performance_cpu_var = tk.StringVar(value=str(PERFORMANCE_CPU_LIMIT))
+    performance_memory_var = tk.StringVar(value=str(PERFORMANCE_MEMORY_LIMIT))
+    performance_temperature_var = tk.StringVar(value=str(PERFORMANCE_TEMPERATURE_LIMIT))
     auto_speech_var = tk.BooleanVar(value=SPEAK_AUTO_COMMENTS)
     replies_speech_var = tk.BooleanVar(value=voice_var.get())
     pack_setting_var = tk.StringVar(value=ACTIVE_PACK["name"])
@@ -2764,17 +3021,7 @@ def open_settings():
     speed_setting_var = tk.DoubleVar(value=settings["speed"])
     pitch_setting_var = tk.DoubleVar(value=float(settings.get("pitch", 0.0)))
 
-    general = ttk.LabelFrame(settings_window, text="Screen check-ins", padding=10)
-    general.pack(fill="x", padx=12, pady=(12, 6))
-    ttk.Label(general, text="Wait between check-ins (seconds):").grid(row=0, column=0, sticky="w")
-    ttk.Spinbox(general, from_=5, to=3600, increment=5, width=10, textvariable=interval_var).grid(
-        row=0, column=1, sticky="e", padx=(12, 0))
-    ttk.Label(general, text="Screen-change sensitivity (0 = always comment):").grid(
-        row=1, column=0, sticky="w", pady=(8, 0))
-    ttk.Spinbox(general, from_=0, to=20, increment=1, width=10, textvariable=threshold_var).grid(
-        row=1, column=1, sticky="e", padx=(12, 0), pady=(8, 0))
-
-    voice = ttk.LabelFrame(settings_window, text="Character and voice", padding=10)
+    voice = ttk.LabelFrame(settings_content, text="Character and voice", padding=10)
     voice.pack(fill="x", padx=12, pady=6)
     pack_row = ttk.Frame(voice)
     pack_row.pack(fill="x", pady=(0, 8))
@@ -2826,7 +3073,74 @@ def open_settings():
     ttk.Label(voice, text="Pitch shifting needs librosa (pip install librosa). Zero keeps the original pitch.",
               wraplength=360).pack(anchor="w", pady=(3, 0))
 
-    data = ttk.LabelFrame(settings_window, text="Saved data", padding=10)
+    general = ttk.LabelFrame(settings_content, text="Screen check-ins", padding=10)
+    general.pack(fill="x", padx=12, pady=(12, 6))
+    ttk.Label(general, text="Wait between check-ins (seconds):").grid(row=0, column=0, sticky="w")
+    ttk.Spinbox(general, from_=5, to=3600, increment=5, width=10, textvariable=interval_var).grid(
+        row=0, column=1, sticky="e", padx=(12, 0))
+    ttk.Label(general, text="Screen-change sensitivity (0 = always comment):").grid(
+        row=1, column=0, sticky="w", pady=(8, 0))
+    ttk.Spinbox(general, from_=0, to=20, increment=1, width=10, textvariable=threshold_var).grid(
+        row=1, column=1, sticky="e", padx=(12, 0), pady=(8, 0))
+
+    performance = ttk.LabelFrame(settings_content, text="Computer performance", padding=10)
+    performance.pack(fill="x", padx=12, pady=6)
+    ttk.Checkbutton(performance, text="Monitor CPU, memory, and available temperature sensors",
+                    variable=performance_enabled_var).grid(row=0, column=0, columnspan=2, sticky="w")
+    ttk.Label(performance, text="Check every (seconds):").grid(row=1, column=0, sticky="w", pady=(6, 0))
+    ttk.Spinbox(performance, from_=10, to=600, increment=5, width=10,
+                textvariable=performance_interval_var).grid(row=1, column=1, sticky="e", padx=(12, 0), pady=(6, 0))
+    ttk.Label(performance, text="CPU alert at (%):").grid(row=2, column=0, sticky="w", pady=(5, 0))
+    ttk.Spinbox(performance, from_=50, to=100, increment=5, width=10,
+                textvariable=performance_cpu_var).grid(row=2, column=1, sticky="e", padx=(12, 0), pady=(5, 0))
+    ttk.Label(performance, text="Memory alert at (%):").grid(row=3, column=0, sticky="w", pady=(5, 0))
+    ttk.Spinbox(performance, from_=50, to=100, increment=5, width=10,
+                textvariable=performance_memory_var).grid(row=3, column=1, sticky="e", padx=(12, 0), pady=(5, 0))
+    ttk.Label(performance, text="Temperature alert at (°C):").grid(row=4, column=0, sticky="w", pady=(5, 0))
+    ttk.Spinbox(performance, from_=50, to=110, increment=1, width=10,
+                textvariable=performance_temperature_var).grid(row=4, column=1, sticky="e", padx=(12, 0), pady=(5, 0))
+    ttk.Label(performance, text="Temperature alerts depend on sensors Windows exposes to Pixel.",
+              wraplength=360).grid(row=5, column=0, columnspan=2, sticky="w", pady=(5, 0))
+
+    app_audio = ttk.LabelFrame(settings_content, text="Avoid talking over app audio", padding=10)
+    app_audio.pack(fill="x", padx=12, pady=6)
+    ttk.Label(app_audio, text="Pixel pauses speech while these apps produce audio. Games are unchecked by default.",
+              wraplength=390).pack(anchor="w")
+    app_list_frame = ttk.Frame(app_audio)
+    app_list_frame.pack(fill="x", pady=(5, 0))
+    app_scroll = ttk.Scrollbar(app_list_frame, orient="vertical")
+    app_audio_list = tk.Listbox(app_list_frame, selectmode=tk.MULTIPLE, height=5,
+                                exportselection=False, yscrollcommand=app_scroll.set)
+    app_scroll.config(command=app_audio_list.yview)
+    app_audio_list.pack(side="left", fill="x", expand=True)
+    app_scroll.pack(side="right", fill="y")
+    audio_app_process_names = sorted(set(AUDIO_AVOID_APPS) | set(discover_audio_applications()))
+    display_names = {"chrome.exe": "Google Chrome", "msedge.exe": "Microsoft Edge",
+                     "firefox.exe": "Firefox", "brave.exe": "Brave", "vivaldi.exe": "Vivaldi",
+                     "opera.exe": "Opera", "opera_gx.exe": "Opera GX", "chromium.exe": "Chromium",
+                     "arc.exe": "Arc", "discord.exe": "Discord"}
+    def populate_audio_app_list(selected_names=None):
+        selected_names = set(AUDIO_AVOID_APPS if selected_names is None else selected_names)
+        app_audio_list.delete(0, "end")
+        for process_name in audio_app_process_names:
+            label = f"{display_names.get(process_name, process_name.removesuffix('.exe'))} ({process_name})"
+            app_audio_list.insert("end", label)
+            if process_name in selected_names:
+                app_audio_list.selection_set("end")
+
+    populate_audio_app_list()
+    def refresh_audio_app_list():
+        selected_names = {audio_app_process_names[index] for index in app_audio_list.curselection()}
+        audio_app_process_names[:] = sorted(set(audio_app_process_names) | set(discover_audio_applications()))
+        populate_audio_app_list(selected_names)
+
+    ttk.Button(app_audio, text="Refresh app list", command=refresh_audio_app_list).pack(anchor="e", pady=(4, 0))
+    if not AUDIO_SESSION_MONITOR_OK:
+        ttk.Label(app_audio, text="App audio detection isn't available in this run.",
+                  foreground="#a00000").pack(anchor="w", pady=(4, 0))
+
+
+    data = ttk.LabelFrame(settings_content, text="Saved data", padding=10)
     data.pack(fill="x", padx=12, pady=6)
     ttk.Button(data, text="Review saved notes", command=review_memories).grid(row=0, column=0, sticky="ew", padx=3)
     ttk.Button(data, text="Review conversation", command=review_history).grid(row=0, column=1, sticky="ew", padx=3)
@@ -2837,16 +3151,21 @@ def open_settings():
     data.columnconfigure(0, weight=1)
     data.columnconfigure(1, weight=1)
 
-    buttons = ttk.Frame(settings_window)
-    buttons.pack(fill="x", padx=12, pady=(8, 12))
     ttk.Button(buttons, text="Open packs folder", command=lambda: os.startfile(PACKS_DIR)).pack(side="left")
     ttk.Button(buttons, text="Open workspace folder", command=lambda: os.startfile(WORKSPACE_DIR)).pack(side="left", padx=(8, 0))
 
     def apply_settings():
         global INTERVAL, CHANGE_THRESHOLD, SPEAK_AUTO_COMMENTS, SPEAK_REPLIES
+        global PERFORMANCE_MONITOR_ENABLED, PERFORMANCE_CHECK_INTERVAL
+        global PERFORMANCE_CPU_LIMIT, PERFORMANCE_MEMORY_LIMIT, PERFORMANCE_TEMPERATURE_LIMIT
+        global AUDIO_AVOID_APPS
         try:
             new_interval = int(interval_var.get())
             new_threshold = int(threshold_var.get())
+            new_performance_interval = int(performance_interval_var.get())
+            new_performance_cpu = int(performance_cpu_var.get())
+            new_performance_memory = int(performance_memory_var.get())
+            new_performance_temperature = int(performance_temperature_var.get())
             new_speed = round(float(speed_setting_var.get()), 1)
             new_pitch = round(float(pitch_setting_var.get()) * 2) / 2
             if not -6 <= new_pitch <= 6:
@@ -2855,6 +3174,12 @@ def open_settings():
                 raise ValueError("Check-in interval must be between 5 and 3600 seconds.")
             if not 0 <= new_threshold <= 20:
                 raise ValueError("Sensitivity must be between 0 and 20.")
+            if not 10 <= new_performance_interval <= 600:
+                raise ValueError("Performance check interval must be between 10 and 600 seconds.")
+            if not 50 <= new_performance_cpu <= 100 or not 50 <= new_performance_memory <= 100:
+                raise ValueError("CPU and memory alert levels must be between 50 and 100%.")
+            if not 50 <= new_performance_temperature <= 110:
+                raise ValueError("Temperature alert level must be between 50 and 110°C.")
         except ValueError as e:
             messagebox.showerror("Invalid setting", str(e), parent=settings_window)
             return
@@ -2865,6 +3190,12 @@ def open_settings():
                 activate_pixel_pack(selected_pack)
             INTERVAL = new_interval
             CHANGE_THRESHOLD = new_threshold
+            PERFORMANCE_MONITOR_ENABLED = performance_enabled_var.get()
+            PERFORMANCE_CHECK_INTERVAL = new_performance_interval
+            PERFORMANCE_CPU_LIMIT = new_performance_cpu
+            PERFORMANCE_MEMORY_LIMIT = new_performance_memory
+            PERFORMANCE_TEMPERATURE_LIMIT = new_performance_temperature
+            AUDIO_AVOID_APPS = [audio_app_process_names[index] for index in app_audio_list.curselection()]
             SPEAK_AUTO_COMMENTS = auto_speech_var.get()
             SPEAK_REPLIES = replies_speech_var.get()
             voice_var.set(SPEAK_REPLIES)
@@ -2876,14 +3207,16 @@ def open_settings():
             voice_choice.set(settings["voice"])
             speed_choice.set(new_speed)
             save_config_file()
-            save_settings()
+            save_settings(raise_errors=True)
         except Exception as e:
             messagebox.showerror("Couldn't save settings", str(e), parent=settings_window)
             return
+        PERFORMANCE_SETTINGS_CHANGED.set()
         user_msgs.put(("settings", ""))  # wake the worker so the new interval applies promptly
         set_bubble("Settings saved.")
         settings_window.destroy()
 
+    settings_window.protocol("WM_DELETE_WINDOW", apply_settings)
     ttk.Button(buttons, text="Save", command=apply_settings).pack(side="right")
     ttk.Button(buttons, text="Cancel", command=settings_window.destroy).pack(side="right", padx=(0, 8))
 
@@ -3031,7 +3364,7 @@ def poll():
 # 12. START EVERYTHING
 # ---------------------------------------------------------------------
 draw_face("idle")                                        # show the starting face
-BUILD = "tools-7"      # a label so you can tell which version you're running. Change it whenever you update the script.
+BUILD = "app-audio-1"      # a label so you can tell which version you're running. Change it whenever you update the script.
 set_bubble(f"Hi! I'm Pixel (build {BUILD}). Right-click me for options, or double-click to type.", seconds=10)
 print("Pixel is using model tool calling for requested actions.")
 if HIDE_FROM_CAPTURE:
@@ -3039,6 +3372,8 @@ if HIDE_FROM_CAPTURE:
 restore_timers()                                         # bring back timers saved from last time
 threading.Thread(target=timer_watcher, daemon=True).start()  # watch the clock for timers going off
 threading.Thread(target=worker, daemon=True).start()     # start the model-talking job
+threading.Thread(target=performance_watcher, daemon=True).start()  # monitor CPU, memory, and available temperatures
+threading.Thread(target=application_audio_watcher, daemon=True).start()  # pause speech during selected app audio
 threading.Thread(target=mail_watcher, daemon=True).start()  # start the email checker
 if VOICE_OUT_OK:
     threading.Thread(target=speaker, daemon=True).start()        # start the voice
@@ -3050,3 +3385,4 @@ poll()                                                   # start checking for up
 threading.Thread(target=calendar_job, daemon=True).start()   # once-a-day rundown (if Google Calendar is connected)
 root.mainloop()                                          # run the window until you close it
 # ("daemon=True" means the background jobs stop automatically when you close the window.)
+
