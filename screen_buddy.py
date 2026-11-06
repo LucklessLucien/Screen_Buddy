@@ -591,6 +591,7 @@ ui_events = queue.Queue()    # background jobs  ->  window
                              # items look like ("happy", "Nice!"), ("speak", "..."), ("alert", "..."), ("status", "...")
 
 speak_queue = queue.Queue()  # window  ->  speaker thread (text waiting to be read aloud)
+AUTO_SPEECH_PENDING = threading.Event()  # at most one automatic line waits or plays
 
 paused = threading.Event()   # an on/off flag: when "set", no screenshots are taken
 
@@ -858,6 +859,7 @@ kokoro = None                   # the natural voice engine, once it has loaded
 interrupt = threading.Event()   # when set, Pixel stops whatever she's saying
 SELECTED_APP_AUDIO_ACTIVE = threading.Event()  # pauses Pixel's voice while selected apps make sound
 APP_AUDIO_QUIET_DELAY_SECONDS = 1.0  # require sustained silence before Pixel resumes speaking
+APP_AUDIO_ACTIVITY_VERSION = 0  # changes whenever selected-app audio starts, to invalidate stale comments
 APP_AUDIO_LAST_ERROR = None
 
 
@@ -910,7 +912,7 @@ def voice_lang(voice):
     return "en-gb" if voice.startswith("b") else "en-us"
 
 
-def speak_with_kokoro(text):
+def speak_with_kokoro(text, cancel_if_app_audio=False, app_audio_version=None):
     """Speaks using the natural voice. The text is split into sentences, and the
     next sentence is prepared while the current one is playing, so there are
     no long gaps."""
@@ -918,10 +920,11 @@ def speak_with_kokoro(text):
     pitch = float(settings.get("pitch", 0.0))
     sentences = [s for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s]
     ready = queue.Queue()                    # finished audio waiting to be played
+    cancel_generation = threading.Event()
 
     def make_audio():
         for s in sentences:
-            if interrupt.is_set():
+            if interrupt.is_set() or cancel_generation.is_set():
                 break
             try:
                 samples, sample_rate = kokoro.create(s, voice=voice, speed=speed, lang=voice_lang(voice))
@@ -934,15 +937,23 @@ def speak_with_kokoro(text):
         ready.put(None)                      # None means "no more audio coming"
 
     threading.Thread(target=make_audio, daemon=True).start()
-    while not interrupt.is_set():
+    while not interrupt.is_set() and not cancel_generation.is_set():
         item = ready.get()
         if item is None:
             break
         samples, sample_rate = item
-        # Wait while selected applications are producing output. If their
-        # audio begins mid-sentence, stop and replay that sentence afterward.
+        if (cancel_if_app_audio and app_audio_version is not None
+                and app_audio_version != APP_AUDIO_ACTIVITY_VERSION):
+            cancel_generation.set()
+            return
+        # Direct replies can wait for app audio; automatic comments are dropped.
         while not interrupt.is_set():
-            if SELECTED_APP_AUDIO_ACTIVE.is_set():
+            if (SELECTED_APP_AUDIO_ACTIVE.is_set()
+                    or (cancel_if_app_audio and app_audio_version is not None
+                        and app_audio_version != APP_AUDIO_ACTIVITY_VERSION)):
+                if cancel_if_app_audio:
+                    cancel_generation.set()
+                    return
                 time.sleep(0.1)
                 continue
             sd.play(samples, sample_rate)
@@ -956,6 +967,9 @@ def speak_with_kokoro(text):
                 if stream is None or not stream.active:
                     break
                 time.sleep(0.05)
+            if interrupted_by_app and cancel_if_app_audio:
+                cancel_generation.set()
+                return
             if interrupt.is_set() or not interrupted_by_app:
                 break
 
@@ -1006,6 +1020,7 @@ def stop_speaking():
             speak_queue.get_nowait()
         except queue.Empty:
             break
+    AUTO_SPEECH_PENDING.clear()
     if AUDIO_OK:
         try:
             sd.stop()                        # cut off the natural voice
@@ -1016,22 +1031,42 @@ def speaker():
     """Background job: takes text from speak_queue and says it out loud.
     It's a separate thread because speaking takes time and would freeze the window."""
     while True:
-        text = speak_queue.get()             # wait here until there's something to say
+        item = speak_queue.get()             # wait here until there's something to say
+        if isinstance(item, tuple):
+            text, cancel_if_app_audio = item[:2]
+            app_audio_version = item[2] if len(item) > 2 else None
+        else:                                # allow any legacy queued text to finish normally
+            text, cancel_if_app_audio, app_audio_version = item, False, None
         interrupt.clear()                    # a new thing to say: reset the "stop" flag
+        if (cancel_if_app_audio and (SELECTED_APP_AUDIO_ACTIVE.is_set()
+                or (app_audio_version is not None
+                    and app_audio_version != APP_AUDIO_ACTIVITY_VERSION))):
+            AUTO_SPEECH_PENDING.clear()
+            continue
         try:
             if kokoro is not None:
-                speak_with_kokoro(text)
+                speak_with_kokoro(text, cancel_if_app_audio=cancel_if_app_audio,
+                                  app_audio_version=app_audio_version)
             else:
                 ui_events.put(("idle", "My natural voice is unavailable, so I can't speak right now."))
         except Exception as e:
             print(f"(Voice error: {e})")     # a voice glitch should never crash Pixel
+        finally:
+            if cancel_if_app_audio:
+                AUTO_SPEECH_PENDING.clear()
 
 
-def speak(text):
+def speak(text, cancel_if_app_audio=False, app_audio_version=None):
     """Queues text to be spoken, if voice output is available and switched on.
     Only call this from the window's thread (it reads the menu checkbox)."""
     if VOICE_OUT_OK and voice_var.get() and text:
-        speak_queue.put(text)
+        if cancel_if_app_audio:
+            if (SELECTED_APP_AUDIO_ACTIVE.is_set() or AUTO_SPEECH_PENDING.is_set()
+                    or (app_audio_version is not None
+                        and app_audio_version != APP_AUDIO_ACTIVITY_VERSION)):
+                return
+            AUTO_SPEECH_PENDING.set()
+        speak_queue.put((text, cancel_if_app_audio, app_audio_version))
 
 
 # ---------------------------------------------------------------------
@@ -2540,6 +2575,7 @@ def selected_application_audio_is_active():
 
 def application_audio_watcher():
     """Pause during selected-app audio and resume only after a full quiet interval."""
+    global APP_AUDIO_ACTIVITY_VERSION
     if not AUDIO_SESSION_MONITOR_OK:
         print("(App-specific quieting needs the Windows audio-session support.)")
         return
@@ -2547,6 +2583,8 @@ def application_audio_watcher():
     while True:
         try:
             if selected_application_audio_is_active():
+                if not SELECTED_APP_AUDIO_ACTIVE.is_set():
+                    APP_AUDIO_ACTIVITY_VERSION += 1
                 last_active_time = time.monotonic()
                 SELECTED_APP_AUDIO_ACTIVE.set()
             elif (last_active_time is not None
@@ -2617,6 +2655,8 @@ def worker():
             except queue.Empty:
                 # Nothing arrived: this is an automatic comment.
                 kind, text = "auto", None
+                if SELECTED_APP_AUDIO_ACTIVE.is_set():
+                    continue                     # don't generate screen comments over app audio
                 if not setup_done.is_set():
                     continue                     # Ollama or the model is still being set up: stay quiet
                 # Nothing new on screen? Stay quiet and wait for the next cycle.
@@ -2661,9 +2701,13 @@ def worker():
                 # The conversation is: persona (plus saved notes), the last 20 history items, then the new message.
                 # The * "spreads" the history list into the message list.
                 messages = [{"role": "system", "content": PERSONA + memory_text()}, *history[-20:], message]
+                audio_version_at_request = APP_AUDIO_ACTIVITY_VERSION
                 reply, notes = chat_with_tools(messages, kind, lambda: grab_screen(sct))
                 if request_pack_name != ACTIVE_PACK["name"]:
                     continue     # discard a reply from the character that was active before a pack switch
+                if (kind == "auto" and (SELECTED_APP_AUDIO_ACTIVE.is_set()
+                                         or audio_version_at_request != APP_AUDIO_ACTIVITY_VERSION)):
+                    continue     # audio began while Pixel was thinking; discard this screen comment
                 if not reply.strip():                                   # the model said nothing: never leave Pixel silent
                     reply = "[idle] Done." if notes else "[idle] Hmm, I'm not sure what to say."
 
@@ -2691,7 +2735,9 @@ def worker():
                 # Ask the window to read it aloud. Automatic screen comments
                 # stay silent unless SPEAK_AUTO_COMMENTS is True.
                 if kind not in ("auto", "performance") or SPEAK_AUTO_COMMENTS:
-                    ui_events.put(("speak", spoken))
+                    cancel_for_app_audio = kind in ("auto", "performance", "mail")
+                    ui_events.put(("speak", (spoken, cancel_for_app_audio,
+                                              audio_version_at_request if cancel_for_app_audio else None)))
 
                 # Status lines from tools ("Timer: tea in 5 minutes") go under his reply.
                 for note in notes:
@@ -3536,7 +3582,13 @@ def poll():
                 append_bubble("\n" + payload)        # a tool's status line, e.g. "Timer: tea in 5 minutes"
                 continue
             if expr == "speak":
-                speak(payload)                       # read the reply aloud
+                if isinstance(payload, tuple):
+                    speech_text, cancel_for_app_audio = payload[:2]
+                    app_audio_version = payload[2] if len(payload) > 2 else None
+                else:
+                    speech_text, cancel_for_app_audio, app_audio_version = payload, False, None
+                speak(speech_text, cancel_if_app_audio=cancel_for_app_audio,
+                      app_audio_version=app_audio_version)
                 continue
             if expr == "mic":
                 # Message from the talk hotkey: start, stop, or toggle the microphone.
@@ -3559,7 +3611,7 @@ def poll():
 # 12. START EVERYTHING
 # ---------------------------------------------------------------------
 draw_face("idle")                                        # show the starting face
-BUILD = "app-weather-1"    # a label so you can tell which version you're running. Change it whenever you update the script.
+BUILD = "app-audio-cancel-1"  # a label so you can tell which version you're running. Change it whenever you update the script.
 set_bubble(f"Hi! I'm Pixel (build {BUILD}). Right-click me for options, or double-click to type.", seconds=10)
 print("Pixel is using model tool calling for requested actions.")
 if HIDE_FROM_CAPTURE:
